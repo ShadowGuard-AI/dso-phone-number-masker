@@ -1,3 +1,5 @@
+![Banner](banner.png)
+
 # dso-phone-number-masker
 Masks or replaces phone numbers in text and data files, preserving format and area code consistency (where possible) to maintain data usability for analysis after sanitization. - Focused on Tools for sanitizing and obfuscating sensitive data within text files and structured data formats
 
