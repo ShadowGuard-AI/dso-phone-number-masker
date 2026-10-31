@@ -34,7 +34,12 @@ def setup_argparse():
     parser.add_argument(
         "-o",
         "--output_file",
-        help="Path to the output file. If not specified, overwrites the input file.",
+        help="Path to the output file. Required unless --in-place is given. An output path that resolves to the input file is refused.",
+    )
+    parser.add_argument(
+        "--in-place",
+        action="store_true",
+        help="Overwrite the input file in place. Only applies when -o is not given.",
     )
     parser.add_argument(
         "-m",
@@ -84,18 +89,33 @@ def detect_encoding(file_path):
         return None
 
 
-def mask_phone_number(phone_number, mask_char="X"):
-    """
-    Masks a phone number, replacing digits with the specified character.
+def _area_digit_indexes(phone_number):
+    digits = [c for c in phone_number if c.isdigit()]
+    if len(digits) == 11 and digits[0] == "1":
+        return {1, 2, 3}
+    return {0, 1, 2}
 
-    Args:
-        phone_number (str): The phone number to mask.
-        mask_char (str): The character to use for masking. Defaults to 'X'.
 
-    Returns:
-        str: The masked phone number.
-    """
-    return "".join([mask_char if char.isdigit() else char for char in phone_number])
+def _extract_area_code(phone_number):
+    digits = [c for c in phone_number if c.isdigit()]
+    if len(digits) == 11 and digits[0] == "1":
+        return "".join(digits[1:4])
+    if len(digits) >= 3:
+        return "".join(digits[0:3])
+    return None
+
+
+def mask_phone_number(phone_number, mask_char="X", keep_area_code=False):
+    area = _area_digit_indexes(phone_number) if keep_area_code else set()
+    out = []
+    idx = -1
+    for char in phone_number:
+        if char.isdigit():
+            idx += 1
+            out.append(char if idx in area else mask_char)
+        else:
+            out.append(char)
+    return "".join(out)
 
 
 def replace_phone_number(phone_number, keep_area_code=False):
@@ -115,20 +135,17 @@ def replace_phone_number(phone_number, keep_area_code=False):
         # than the matching one used in find_phone_numbers, because we're trying to *extract*
         # something here.  The more restrictive one in find_phone_numbers is more security focused,
         # as it will avoid false positives.
-        match = re.match(r"(\d{3})[-.\s]?(\d{3})[-.\s]?(\d{4})", phone_number)
+        area_code = _extract_area_code(phone_number) if keep_area_code else None
 
-        if keep_area_code and match:
-            area_code = match.group(1)
+        if keep_area_code and area_code:
             new_number = fake.phone_number()
 
             new_match = re.match(r"(\d{3})[-.\s]?(\d{3})[-.\s]?(\d{4})", new_number)
 
             if new_match:
-
-                # Reassemble with existing area code
                 replaced_number = area_code + "-" + new_match.group(2) + "-" + new_match.group(3)
             else:
-                logging.warning(f"Failed to parse generated phone number {new_number}, using full random number.")
+                logging.warning("Failed to parse a generated phone number, using a full generated number.")
                 replaced_number = fake.phone_number()
 
         else:
@@ -151,13 +168,14 @@ def find_phone_numbers(text):
     Returns:
         list: A list of phone numbers found in the text.
     """
-    # Regular expression pattern to match phone numbers, more specific and secure
     pattern = re.compile(
-        r"(?<!\d)(\d{3}[-.\s]?\d{3}[-.\s]?\d{4})(?!\d)", re.VERBOSE
-    )  # Added negative lookahead and lookbehind to avoid catching parts of longer sequences
-    return list(
-        set(re.findall(pattern, text))
-    )  # Use set to remove duplicates before converting to list
+        r"(?<!\d)(?:\+?1[\s.\-]?)?(?:\(\d{3}\)\s?|\d{3}[-.\s]?)\d{3}[-.\s]?\d{4}(?!\d)"
+    )
+    seen = []
+    for m in pattern.finditer(text):
+        if m.group(0) not in seen:
+            seen.append(m.group(0))
+    return seen
 
 
 def process_file(input_file, output_file=None, mask_char="X", replace=False, keep_area_code=False):
@@ -188,16 +206,22 @@ def process_file(input_file, output_file=None, mask_char="X", replace=False, kee
         sys.exit(1)
 
     phone_numbers = find_phone_numbers(content)
-    logging.debug(f"Found phone numbers: {phone_numbers}")
+    total = sum(content.count(p) for p in phone_numbers)
+    logging.debug(f"Found phone numbers: count={len(phone_numbers)}")
+    logging.info(f"Found {total} phone number occurrence(s).")
+    if total == 0:
+        logging.error("No phone numbers found; nothing was masked or replaced.")
+        sys.exit(1)
 
     for phone_number in phone_numbers:
+        position = content.find(phone_number)
         if replace:
             replacement = replace_phone_number(phone_number, keep_area_code)
-            logging.info(f"Replacing '{phone_number}' with '{replacement}'")
+            logging.info(f"Replacing phone number at position {position} (count only, value not logged).")
             content = content.replace(phone_number, replacement)
         else:
-            masked_number = mask_phone_number(phone_number, mask_char)
-            logging.info(f"Masking '{phone_number}' with '{masked_number}'")
+            masked_number = mask_phone_number(phone_number, mask_char, keep_area_code=keep_area_code)
+            logging.info(f"Masking phone number at position {position} (count only, value not logged).")
             content = content.replace(phone_number, masked_number)
 
     if output_file is None:
@@ -224,7 +248,16 @@ def main():
     logging.debug(f"Arguments: {args}")
 
     input_file = args.input_file
-    output_file = args.output_file
+    if args.output_file:
+        if os.path.realpath(args.output_file) == os.path.realpath(input_file):
+            logging.error("Output file resolves to the input file; refusing to overwrite it. Use --in-place to overwrite intentionally.")
+            sys.exit(1)
+        output_file = args.output_file
+    elif getattr(args, "in_place", False):
+        output_file = None
+    else:
+        logging.error("No output file given. Pass -o for an output file or --in-place to overwrite the input file.")
+        sys.exit(1)
     mask_char = args.mask_char
     replace = args.replace
     keep_area_code = args.keep_area_code
